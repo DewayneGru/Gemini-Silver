@@ -1,0 +1,741 @@
+Add the persistent EpistemicWatchdog singleton and POST /silver-ingest handler to scripts/antigravity_sync_daemon.py, then replace src/components/SilverVerificationPanel.tsx with the updated component containing the collapsible quick-ingest drawer.
+
+1. Add POST /silver-ingest to scripts/antigravity_sync_daemon.py
+
+Keeping a module-level EpistemicWatchdog instance inside the daemon ensures the KuramotoGovernor oscillator phases (R and K) evolve continuously across successive ingests rather than resetting on every request.
+
+from dataclasses import asdict
+import json
+import os
+import subprocess
+import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from synapse_edge_watchdog import EpistemicWatchdog  # noqa: E402
+
+SILVER_STATE_DIR = REPO_ROOT / ".silver_state"
+COMMITTED_LEDGER_PATH = SILVER_STATE_DIR / "silver_committed_ledger.jsonl"
+QUARANTINE_LEDGER_PATH = SILVER_STATE_DIR / "silver_scratchpad_quarantine.jsonl"
+VERIFICATION_RESULTS_PATH = SILVER_STATE_DIR / "silver_verification_results.jsonl"
+VERIFY_SCRIPT_PATH = REPO_ROOT / "scripts" / "verify_silver_ledger.py"
+
+ALLOWED_COMPILERS = {"clang++", "g++"}
+_SILVER_VERIFY_LOCK = threading.Lock()
+_SILVER_INGEST_LOCK = threading.Lock()
+_WATCHDOG_INSTANCE: EpistemicWatchdog | None = None
+
+
+def _get_watchdog() -> EpistemicWatchdog:
+    global _WATCHDOG_INSTANCE
+    raw_key = os.environ.get("SYNAPSE_HMAC_KEY", "")
+    if not raw_key:
+        raise RuntimeError("SYNAPSE_HMAC_KEY is not set in the sync daemon environment.")
+    key_bytes = raw_key.encode("utf-8")
+    if _WATCHDOG_INSTANCE is None or _WATCHDOG_INSTANCE.signing_key != key_bytes:
+        _WATCHDOG_INSTANCE = EpistemicWatchdog(state_dir=SILVER_STATE_DIR, signing_key=key_bytes)
+    return _WATCHDOG_INSTANCE
+
+
+def ingest_silver_output(payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    raw_output = str(payload.get("raw_output") or payload.get("content") or "").strip()
+    if not raw_output:
+        return 400, {"ok": False, "error": "Missing raw Gemini 3.1 Pro output text."}
+
+    prompt_id = str(payload.get("prompt_id") or "").strip() or f"silver-{int(time.time())}"
+
+    with _SILVER_INGEST_LOCK:
+        try:
+            watchdog = _get_watchdog()
+        except RuntimeError as exc:
+            return 400, {"ok": False, "error": str(exc)}
+
+        try:
+            receipt = watchdog.evaluate_and_route(prompt_id=prompt_id, raw_model_output=raw_output)
+        except (ValueError, json.JSONDecodeError) as exc:
+            return 422, {
+                "ok": False,
+                "error": f"Telemetry extraction failed: {exc}",
+            }
+
+        return 200, {
+            "ok": True,
+            "prompt_id": prompt_id,
+            "receipt": asdict(receipt),
+            "state": get_silver_verifications_state(),
+        }
+
+
+Register if route == "/silver-ingest": inside do_POST on AntigravitySyncHandler alongside /apply-patch and /silver-verify:
+
+        if route == "/silver-ingest":
+            status_code, response_body = ingest_silver_output(payload)
+            self._send_json(status_code, response_body)
+            return
+
+
+2. Update src/components/SilverVerificationPanel.tsx with the Quick-Ingest Drawer
+
+This version adds a collapsible Ingest Output drawer with live detection of the trailing ```json telemetry block, Cmd+Enter / Ctrl+Enter submission, instant receipt feedback (showing Kuramoto R, steering directive, and truncated merkle_leaf), and automatic tab switching to whichever ledger received the record.
+
+import React, { useCallback, useEffect, useMemo, useState } from "react";
+
+const DEFAULT_DAEMON_URL = "[http://127.0.0.1:8765](http://127.0.0.1:8765)";
+
+interface GovernorState {
+  order_parameter_r: number;
+  r_target: number;
+  coupling_k: number;
+  steering_directive: string;
+}
+
+interface TelemetryPayload {
+  steering_mode_honored: string;
+  claim_status: "VERIFIED" | "HYPOTHESIS" | string;
+  core_mechanism: string;
+  invariants_checked: string[];
+  hidden_assumptions: string[];
+  falsification_test: string;
+  ready_for_ledger_commit: boolean;
+}
+
+interface DemotionProvenance {
+  source_ledger?: string;
+  prior_merkle_leaf?: string;
+  prior_hmac_sha256?: string;
+  signature_valid?: boolean;
+}
+
+interface LedgerEnvelope {
+  prompt_id: string;
+  timestamp_ms: number;
+  governor?: GovernorState;
+  telemetry?: TelemetryPayload;
+  committed: boolean;
+  quarantine_reason?: string | null;
+  demoted_at_ms?: number;
+  demotion_provenance?: DemotionProvenance;
+}
+
+interface SignedLedgerRecord {
+  envelope?: LedgerEnvelope;
+  merkle_leaf?: string;
+  hmac_sha256?: string;
+  _corrupt_line?: number;
+  _error?: string;
+  _raw?: string;
+}
+
+interface VerificationVerdict {
+  prompt_id: string;
+  merkle_leaf: string;
+  verified_signature: boolean;
+  passed: boolean;
+  demoted_to_quarantine: boolean;
+  failure_reason: string | null;
+  cpp_metrics?: {
+    alignment_64?: boolean;
+    unit_suite?: {
+      passed: boolean;
+      duration_ms: number;
+      exit_code: number;
+    };
+  };
+  timestamp_ms: number;
+}
+
+interface SilverVerificationsState {
+  ok: boolean;
+  hmac_key_configured: boolean;
+  counts: {
+    committed: number;
+    quarantined: number;
+    verifications: number;
+  };
+  committed: SignedLedgerRecord[];
+  quarantined: SignedLedgerRecord[];
+  verifications: VerificationVerdict[];
+}
+
+interface VerifyRunReport {
+  total_evaluated: number;
+  kept_in_committed_ledger: number;
+  demoted_to_quarantine: number;
+  dry_run: boolean;
+}
+
+interface IngestAuditReceipt {
+  timestamp_ms: number;
+  merkle_leaf_hex: string;
+  hmac_sha256_hex: string;
+  order_parameter_r: number;
+  coupling_k: number;
+  steering_directive: string;
+  committed: boolean;
+  quarantine_reason: string | null;
+}
+
+export interface SilverVerificationPanelProps {
+  daemonBaseUrl?: string;
+  unitTestArgs?: string;
+}
+
+function truncateHash(hash?: string): string {
+  if (!hash) return "unsigned";
+  if (hash.length <= 16) return hash;
+  return `${hash.slice(0, 10)}…${hash.slice(-8)}`;
+}
+
+function formatTimestamp(ms?: number): string {
+  if (!ms) return "—";
+  return new Date(ms).toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
+export const SilverVerificationPanel: React.FC<SilverVerificationPanelProps> = ({
+  daemonBaseUrl = DEFAULT_DAEMON_URL,
+  unitTestArgs = "--json",
+}) => {
+  const [data, setData] = useState<SilverVerificationsState null |>(null);
+  const [activeTab, setActiveTab] = useState<"committed" | "quarantined">("committed");
+  const [isLoading, setIsLoading] = useState<boolean>(true);
+  const [runningMode, setRunningMode] = useState<"dry" | "demote" | null>(null);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [lastReport, setLastReport] = useState<{
+    allPassed: boolean;
+    report: VerifyRunReport;
+  } | null>(null);
+  const [copiedLeaf, setCopiedLeaf] = useState<string | null>(null);
+
+  // Quick-ingest drawer state
+  const [isIngestOpen, setIsIngestOpen] = useState<boolean>(false);
+  const [ingestPromptId, setIngestPromptId] = useState<string>("");
+  const [ingestRawOutput, setIngestRawOutput] = useState<string>("");
+  const [isIngesting, setIsIngesting] = useState<boolean>(false);
+  const [lastIngestResult, setLastIngestResult] = useState<{
+    promptId: string;
+    receipt: IngestAuditReceipt;
+  } | null>(null);
+
+  const hasJsonBlock = useMemo(
+    () => /```json\s*[\s\S]*?\s*```/.test(ingestRawOutput),
+    [ingestRawOutput]
+  );
+
+  const loadState = useCallback(async () => {
+    setIsLoading(true);
+    setErrorMsg(null);
+    try {
+      const res = await fetch(`${daemonBaseUrl}/silver-verifications`);
+      const json = await res.json();
+      if (!res.ok || !json.ok) {
+        throw new Error(json.error || `HTTP ${res.status}`);
+      }
+      setData(json as SilverVerificationsState);
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : "Failed to reach sync daemon.");
+    } finally {
+      setIsLoading(false);
+    }
+  }, [daemonBaseUrl]);
+
+  useEffect(() => {
+    void loadState();
+  }, [loadState]);
+
+  const handleIngestSubmit = async () => {
+    if (!ingestRawOutput.trim() || isIngesting) return;
+    setIsIngesting(true);
+    setErrorMsg(null);
+    try {
+      const res = await fetch(`${daemonBaseUrl}/silver-ingest`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          prompt_id: ingestPromptId.trim() || undefined,
+          raw_output: ingestRawOutput,
+        }),
+      });
+      const json = await res.json();
+      if (!res.ok || !json.ok) {
+        throw new Error(json.error || `Ingest failed (HTTP ${res.status})`);
+      }
+
+      const receipt = json.receipt as IngestAuditReceipt;
+      setLastIngestResult({
+        promptId: String(json.prompt_id),
+        receipt,
+      });
+
+      if (json.state) {
+        setData(json.state as SilverVerificationsState);
+      } else {
+        await loadState();
+      }
+
+      setActiveTab(receipt.committed ? "committed" : "quarantined");
+      setIngestPromptId("");
+      setIngestRawOutput("");
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : "Failed to ingest Gemini 3.1 Pro output.");
+    } finally {
+      setIsIngesting(false);
+    }
+  };
+
+  const handleRunVerification = async (dryRun: boolean) => {
+    setRunningMode(dryRun ? "dry" : "demote");
+    setErrorMsg(null);
+    try {
+      const res = await fetch(`${daemonBaseUrl}/silver-verify`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          dry_run: dryRun,
+          unit_test_args: unitTestArgs,
+        }),
+      });
+      const json = await res.json();
+      if (!res.ok || !json.ok) {
+        throw new Error(json.error || `Verification failed (HTTP ${res.status})`);
+      }
+      setLastReport({
+        allPassed: Boolean(json.all_passed),
+        report: json.report as VerifyRunReport,
+      });
+      if (json.state) {
+        setData(json.state as SilverVerificationsState);
+      } else {
+        await loadState();
+      }
+      if (!dryRun && json.report?.demoted_to_quarantine > 0) {
+        setActiveTab("quarantined");
+      }
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : "Verification execution error.");
+    } finally {
+      setRunningMode(null);
+    }
+  };
+
+  const handleCopyLeaf = async (leaf?: string) => {
+    if (!leaf) return;
+    try {
+      await navigator.clipboard.writeText(leaf);
+      setCopiedLeaf(leaf);
+      setTimeout(() => setCopiedLeaf((prev) => (prev === leaf ? null : prev)), 1500);
+    } catch {
+      // Clipboard unavailable in restricted context
+    }
+  };
+
+  const verdictByPrompt = useMemo(() => {
+    const map = new Map<string, VerificationVerdict>();
+    for (const v of data?.verifications ?? []) {
+      map.set(v.prompt_id, v);
+    }
+    return map;
+  }, [data?.verifications]);
+
+  const records =
+    activeTab === "committed" ? (data?.committed ?? []) : (data?.quarantined ?? []);
+
+  return (
+    <section className="rounded-xl border border-zinc-800 bg-zinc-950 text-zinc-100 shadow-lg">
+      {/* Header & Action Controls */}
+      <div className="flex flex-wrap items-center justify-between gap-4 border-b border-zinc-800 px-5 py-4">
+        <div className="space-y-1">
+          <div className="flex items-center gap-2.5">
+            <span className="inline-block h-2.5 w-2.5 rounded-full bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.6)]" />
+            <h2 className="text-sm font-semibold tracking-wide text-zinc-100 uppercase">
+              Gemini Silver Epistemic Ledger &amp; C++20 Watchdog
+            </h2>
+            <span className="rounded border border-zinc-800 bg-zinc-900 px-2 py-0.5 font-mono text-[11px] text-zinc-400">
+              R_TARGET = 0.48
+            </span>
+          </div>
+          <p className="text-xs text-zinc-400">
+            Cryptographic Merkle/HMAC audit trail and <code className="text-zinc-300">synapse_stdp.hpp</code> falsification gate
+          </p>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={() => setIsIngestOpen((prev) => !prev)}
+            className={`inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors ${
+              isIngestOpen
+                ? "border-sky-400/60 bg-sky-500/20 text-sky-200"
+                : "border-sky-500/40 bg-sky-500/10 text-sky-300 hover:bg-sky-500/20"
+            }`}
+          >
+            <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M12 5v14" />
+              <path d="M5 12h14" />
+            </svg>
+            {isIngestOpen ? "Close Ingest" : "Ingest Output"}
+          </button>
+
+          <button
+            type="button"
+            onClick={() => void loadState()}
+            disabled={isLoading || runningMode !== null}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-xs font-medium text-zinc-200 hover:bg-zinc-800 disabled:opacity-50"
+          >
+            <svg className={`h-3.5 w-3.5 ${isLoading ? "animate-spin" : ""}`} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8" />
+              <path d="M21 3v5h-5" />
+            </svg>
+            Refresh
+          </button>
+
+          <button
+            type="button"
+            onClick={() => void handleRunVerification(true)}
+            disabled={runningMode !== null || !data?.hmac_key_configured}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-1.5 text-xs font-medium text-amber-300 hover:bg-amber-500/20 disabled:opacity-40"
+          >
+            <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <polygon points="5 3 19 12 5 21 5 3" />
+            </svg>
+            {runningMode === "dry" ? "Running Dry-Run…" : "Dry-Run"}
+          </button>
+
+          <button
+            type="button"
+            onClick={() => void handleRunVerification(false)}
+            disabled={runningMode !== null || !data?.hmac_key_configured}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-emerald-500/40 bg-emerald-500/15 px-3 py-1.5 text-xs font-semibold text-emerald-300 hover:bg-emerald-500/25 disabled:opacity-40"
+          >
+            <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+              <path d="m9 12 2 2 4-4" />
+            </svg>
+            {runningMode === "demote" ? "Verifying & Demoting…" : "Verify & Demote"}
+          </button>
+        </div>
+      </div>
+
+      {/* Collapsible Quick-Ingest Drawer */}
+      {isIngestOpen && (
+        <div className="space-y-3 border-b border-zinc-800 bg-zinc-900/70 px-5 py-4">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <span className="text-xs font-semibold text-sky-300">
+                Quick-Ingest Gemini 3.1 Pro Derivation
+              </span>
+              <span
+                className={`rounded px-2 py-0.5 font-mono text-[10px] ${
+                  hasJsonBlock
+                    ? "border border-emerald-500/30 bg-emerald-500/15 text-emerald-300"
+                    : "border border-zinc-700 bg-zinc-800 text-zinc-400"
+                }`}
+              >
+                {hasJsonBlock ? "```json telemetry detected" : "awaiting ```json telemetry block"}
+              </span>
+            </div>
+
+            <input
+              type="text"
+              value={ingestPromptId}
+              onChange={(e) => setIngestPromptId(e.target.value)}
+              placeholder="Optional prompt_id (e.g. thalamic-delay-02)"
+              className="w-64 rounded-lg border border-zinc-700 bg-zinc-950 px-2.5 py-1 font-mono text-xs text-zinc-200 placeholder-zinc-500 focus:border-sky-500 focus:outline-none"
+            />
+          </div>
+
+          <textarea
+            rows={6}
+            value={ingestRawOutput}
+            onChange={(e) => setIngestRawOutput(e.target.value)}
+            onKeyDown={(e) => {
+              if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+                e.preventDefault();
+                void handleIngestSubmit();
+              }
+            }}
+            placeholder="Paste full Gemini 3.1 Pro response here (including the trailing ```json telemetry block)… Press Cmd+Enter / Ctrl+Enter to evaluate, sign, and route."
+            className="w-full rounded-lg border border-zinc-700/90 bg-zinc-950 p-3 font-mono text-xs leading-relaxed text-zinc-100 placeholder-zinc-500 focus:border-sky-500 focus:outline-none"
+          />
+
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <span className="text-[11px] text-zinc-400">
+              Routes <code className="text-emerald-300">VERIFIED</code> entries with valid invariants to{" "}
+              <code className="text-zinc-300">silver_committed_ledger.jsonl</code>; isolates{" "}
+              <code className="text-amber-300">HYPOTHESIS</code> entries in quarantine.
+            </span>
+
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  setIngestRawOutput("");
+                  setIngestPromptId("");
+                }}
+                disabled={isIngesting || (!ingestRawOutput && !ingestPromptId)}
+                className="rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-xs text-zinc-300 hover:bg-zinc-800 disabled:opacity-40"
+              >
+                Clear
+              </button>
+
+              <button
+                type="button"
+                onClick={() => void handleIngestSubmit()}
+                disabled={isIngesting || !ingestRawOutput.trim() || !data?.hmac_key_configured}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-sky-500/50 bg-sky-500/20 px-3.5 py-1.5 text-xs font-semibold text-sky-200 hover:bg-sky-500/30 disabled:opacity-40"
+              >
+                {isIngesting ? "Evaluating & Signing…" : "Evaluate, Sign & Route"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Missing HMAC Key Warning */}
+      {data && !data.hmac_key_configured && (
+        <div className="border-b border-amber-500/30 bg-amber-950/40 px-5 py-2.5 text-xs text-amber-300">
+          <strong>SYNAPSE_HMAC_KEY</strong> is not set in the daemon process environment. Export it before starting{" "}
+          <code className="rounded bg-black/40 px-1 py-0.5">antigravity_sync_daemon.py</code> to enable ingestion and C++20 verification.
+        </div>
+      )}
+
+      {/* Error Banner */}
+      {errorMsg && (
+        <div className="border-b border-rose-500/30 bg-rose-950/40 px-5 py-2.5 text-xs text-rose-300">
+          {errorMsg}
+        </div>
+      )}
+
+      {/* Last Ingest Receipt Banner */}
+      {lastIngestResult && (
+        <div
+          className={`flex flex-wrap items-center justify-between gap-2 border-b px-5 py-2.5 text-xs ${
+            lastIngestResult.receipt.committed
+              ? "border-emerald-500/30 bg-emerald-950/30 text-emerald-200"
+              : "border-amber-500/30 bg-amber-950/30 text-amber-200"
+          }`}
+        >
+          <div className="flex flex-wrap items-center gap-3">
+            <span className="font-semibold uppercase tracking-wider">
+              {lastIngestResult.receipt.committed ? "Committed to Ledger" : "Routed to Quarantine"}
+            </span>
+            <span className="font-mono text-[11px]">{lastIngestResult.promptId}</span>
+            <span className="font-mono text-[11px]">
+              R={lastIngestResult.receipt.order_parameter_r.toFixed(3)} ({lastIngestResult.receipt.steering_directive})
+            </span>
+            <span className="font-mono text-[11px]">
+              leaf:{truncateHash(lastIngestResult.receipt.merkle_leaf_hex)}
+            </span>
+            {lastIngestResult.receipt.quarantine_reason && (
+              <span className="text-amber-300/90">— {lastIngestResult.receipt.quarantine_reason}</span>
+            )}
+          </div>
+          <button
+            type="button"
+            onClick={() => setLastIngestResult(null)}
+            className="text-zinc-400 hover:text-zinc-200"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
+
+      {/* Last Verification Run Summary */}
+      {lastReport && (
+        <div
+          className={`flex flex-wrap items-center justify-between gap-2 border-b px-5 py-2.5 text-xs ${
+            lastReport.allPassed
+              ? "border-emerald-500/30 bg-emerald-950/30 text-emerald-200"
+              : "border-amber-500/30 bg-amber-950/30 text-amber-200"
+          }`}
+        >
+          <div className="flex flex-wrap items-center gap-3">
+            <span className="font-semibold uppercase tracking-wider">
+              {lastReport.report.dry_run ? "Dry-Run Complete" : "Ledger Sweep Complete"}
+            </span>
+            <span>Evaluated: <strong>{lastReport.report.total_evaluated}</strong></span>
+            <span>Kept: <strong>{lastReport.report.kept_in_committed_ledger}</strong></span>
+            <span>
+              {lastReport.report.dry_run ? "Would Demote:" : "Demoted:"}{" "}
+              <strong>{lastReport.report.demoted_to_quarantine}</strong>
+            </span>
+          </div>
+          <button
+            type="button"
+            onClick={() => setLastReport(null)}
+            className="text-zinc-400 hover:text-zinc-200"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
+
+      {/* Tabs: Committed vs. Quarantined */}
+      <div className="flex items-center justify-between border-b border-zinc-800 bg-zinc-900/50 px-5">
+        <div className="flex gap-1">
+          <button
+            type="button"
+            onClick={() => setActiveTab("committed")}
+            className={`border-b-2 px-3 py-2.5 text-xs font-medium transition-colors ${
+              activeTab === "committed"
+                ? "border-emerald-400 text-emerald-300"
+                : "border-transparent text-zinc-400 hover:text-zinc-200"
+            }`}
+          >
+            Committed Ledger{" "}
+            <span className="ml-1.5 rounded-full bg-zinc-800 px-2 py-0.5 font-mono text-[11px] text-zinc-200">
+              {data?.counts.committed ?? 0}
+            </span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setActiveTab("quarantined")}
+            className={`border-b-2 px-3 py-2.5 text-xs font-medium transition-colors ${
+              activeTab === "quarantined"
+                ? "border-rose-400 text-rose-300"
+                : "border-transparent text-zinc-400 hover:text-zinc-200"
+            }`}
+          >
+            Quarantined Scratchpad{" "}
+            <span className="ml-1.5 rounded-full bg-zinc-800 px-2 py-0.5 font-mono text-[11px] text-zinc-200">
+              {data?.counts.quarantined ?? 0}
+            </span>
+          </button>
+        </div>
+
+        <span className="font-mono text-[11px] text-zinc-500">
+          {data?.counts.verifications ?? 0} C++20 audit verdicts recorded
+        </span>
+      </div>
+
+      {/* Entry List */}
+      <div className="max-h-[34rem] divide-y divide-zinc-800/80 overflow-y-auto">
+        {isLoading && !data ? (
+          <div className="p-8 text-center text-xs text-zinc-400">
+            Loading Silver ledger state…
+          </div>
+        ) : records.length === 0 ? (
+          <div className="p-8 text-center text-xs text-zinc-500">
+            No entries in {activeTab === "committed" ? "silver_committed_ledger.jsonl" : "silver_scratchpad_quarantine.jsonl"}.
+          </div>
+        ) : (
+          records.map((rec, idx) => {
+            if (rec._corrupt_line) {
+              return (
+                <div key={`corrupt-${idx}`} className="bg-rose-950/20 p-4 text-xs text-rose-300">
+                  Corrupt JSONL line #{rec._corrupt_line}: {rec._error}
+                </div>
+              );
+            }
+
+            const env = rec.envelope;
+            const promptId = env?.prompt_id ?? `entry-${idx + 1}`;
+            const verdict = verdictByPrompt.get(promptId);
+            const leaf = rec.merkle_leaf;
+            const priorLeaf = env?.demotion_provenance?.prior_merkle_leaf;
+
+            return (
+              <div key={`${leaf ?? promptId}-${idx}`} className="space-y-2.5 p-4 hover:bg-zinc-900/40">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="font-mono text-xs font-semibold text-zinc-100">
+                      {promptId}
+                    </span>
+
+                    {env?.telemetry?.claim_status && (
+                      <span
+                        className={`rounded px-2 py-0.5 font-mono text-[10px] font-semibold uppercase ${
+                          env.telemetry.claim_status === "VERIFIED"
+                            ? "border border-emerald-500/30 bg-emerald-500/15 text-emerald-300"
+                            : "border border-amber-500/30 bg-amber-500/15 text-amber-300"
+                        }`}
+                      >
+                        {env.telemetry.claim_status}
+                      </span>
+                    )}
+
+                    {env?.governor && (
+                      <span className="rounded border border-zinc-800 bg-zinc-900 px-2 py-0.5 font-mono text-[11px] text-zinc-300">
+                        R={env.governor.order_parameter_r.toFixed(3)} · {env.governor.steering_directive}
+                      </span>
+                    )}
+
+                    {verdict && (
+                      <span
+                        className={`rounded px-2 py-0.5 font-mono text-[10px] font-medium ${
+                          verdict.passed
+                            ? "border border-sky-500/30 bg-sky-500/15 text-sky-300"
+                            : "border border-rose-500/30 bg-rose-500/15 text-rose-300"
+                        }`}
+                      >
+                        C++20: {verdict.passed ? "PASS" : "FAIL"}
+                      </span>
+                    )}
+                  </div>
+
+                  <div className="flex items-center gap-2">
+                    <span className="text-[11px] text-zinc-500">
+                      {formatTimestamp(env?.timestamp_ms)}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => void handleCopyLeaf(leaf)}
+                      title={leaf ? `SHA-256("leaf:" || rawBody): ${leaf}` : "No Merkle leaf"}
+                      className="inline-flex items-center gap-1 rounded border border-zinc-700/80 bg-zinc-900 px-2 py-0.5 font-mono text-[11px] text-zinc-300 hover:border-zinc-500 hover:text-white"
+                    >
+                      <span className="text-zinc-500">leaf:</span>
+                      <span>{truncateHash(leaf)}</span>
+                      {copiedLeaf === leaf && (
+                        <span className="ml-1 text-[10px] text-emerald-400">copied</span>
+                      )}
+                    </button>
+                  </div>
+                </div>
+
+                {env?.telemetry?.core_mechanism && (
+                  <p className="text-xs leading-relaxed text-zinc-200">
+                    {env.telemetry.core_mechanism}
+                  </p>
+                )}
+
+                {env?.telemetry?.falsification_test && (
+                  <div className="rounded-lg border border-zinc-800/90 bg-zinc-900/70 px-3 py-2 font-mono text-[11px] text-zinc-300">
+                    <span className="mr-1.5 text-zinc-500">Falsification:</span>
+                    {env.telemetry.falsification_test}
+                  </div>
+                )}
+
+                {(env?.quarantine_reason || verdict?.failure_reason) && (
+                  <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-rose-500/30 bg-rose-950/30 px-3 py-2 text-xs text-rose-200">
+                    <span>
+                      <strong>Reason:</strong> {verdict?.failure_reason || env?.quarantine_reason}
+                    </span>
+                    {priorLeaf && (
+                      <span className="font-mono text-[11px] text-rose-300/80">
+                        prior_leaf: {truncateHash(priorLeaf)}
+                      </span>
+                    )}
+                  </div>
+                )}
+              </div>
+            );
+          })
+        )}
+      </div>
+    </section>
+  );
+};
+
+export default SilverVerificationPanel;

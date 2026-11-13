@@ -1,0 +1,6 @@
+{
+  "name": "SynapseEdge Epistemic Engine",
+  "description": "First-principles mechanistic reasoning, homeostatic phase steering, adversarial Watchdog falsification, and epistemic ledger isolation workbench.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
