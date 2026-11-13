@@ -8,15 +8,16 @@
 #define SYNAPSE_STATE_DEFINED 1
 
 struct alignas(64) SynapseState {
-    double weight = 0.685;
-    double last_pre_ts = -1.0;
-    double last_post_ts = -1.0;
-    double g_inh = 0.35;
-    double w_min = 0.0;
-    double w_max = 1.0;
-    double max_delta_w = 0.05;
-    float trace_pre = 0.0f;
-    float trace_post = 0.0f;
+    double weight = 0.685;       // [0..7]   Excitatory synaptic weight
+    double last_pre_ts = -1.0;   // [8..15]  Last monotonic presynaptic timestamp (ms)
+    double last_post_ts = -1.0;  // [16..23] Last monotonic postsynaptic timestamp (ms)
+    double last_inh_ts = -1.0;   // [24..31] Last monotonic inhibitory update timestamp (ms)
+    double g_inh = 0.35;         // [32..39] Dynamic cross-homeostatic inhibitory gain
+    double max_delta_w = 0.05;   // [40..47] Per-step excitatory plasticity clamp
+    float w_min = 0.0f;          // [48..51] Lower excitatory weight bound
+    float w_max = 1.0f;          // [52..55] Upper excitatory weight bound
+    float trace_pre = 0.0f;      // [56..59] Compact presynaptic eligibility trace
+    float trace_post = 0.0f;     // [60..63] Compact postsynaptic eligibility trace
 
     static constexpr double kGMin = 0.05;
     static constexpr double kGMax = 2.00;
@@ -28,26 +29,24 @@ struct alignas(64) SynapseState {
         if (!std::isfinite(pre_ts) || !std::isfinite(post_ts) || !std::isfinite(tau_ms) || tau_ms <= 0.0) {
             return false;
         }
-        // Reject non-monotonic timestamps
         if ((last_pre_ts >= 0.0 && pre_ts < last_pre_ts) ||
             (last_post_ts >= 0.0 && post_ts < last_post_ts)) {
             return false;
         }
 
         const double dt = post_ts - pre_ts;
-        double raw_dw = 0.0;
-        if (dt >= 0.0) {
-            raw_dw = 0.025 * std::exp(-dt / tau_ms);
-        } else {
-            raw_dw = -0.026 * std::exp(dt / tau_ms);
-        }
+        const double raw_dw = (dt >= 0.0)
+            ? (0.025 * std::exp(-dt / tau_ms))
+            : (-0.026 * std::exp(dt / tau_ms));
 
         if (!std::isfinite(raw_dw)) {
             return false;
         }
 
         const double clamped_dw = std::max(-max_delta_w, std::min(max_delta_w, raw_dw));
-        const double next_w = std::max(w_min, std::min(w_max, weight + clamped_dw));
+        const double lo = static_cast<double>(w_min);
+        const double hi = static_cast<double>(w_max);
+        const double next_w = std::max(lo, std::min(hi, weight + clamped_dw));
         if (!std::isfinite(next_w)) {
             return false;
         }
@@ -77,22 +76,21 @@ struct alignas(64) SynapseState {
             order_param_r < 0.0 || order_param_r > 1.0) {
             return false;
         }
-        if (last_post_ts >= 0.0 && spike_ts < last_post_ts) {
+        if (last_inh_ts >= 0.0 && spike_ts < last_inh_ts) {
             return false;
         }
 
-        const double dt_spike = (last_post_ts >= 0.0) ? (spike_ts - last_post_ts) : 0.0;
+        const double dt_spike = (last_inh_ts >= 0.0) ? (spike_ts - last_inh_ts) : 0.0;
         const double kernel_decay = std::exp(-dt_spike / tau_inh_ms);
         const double err_sigma = sigma_branch - kSigmaTarget;
         const double err_r = order_param_r - kRTarget;
 
-        // Sub-critical recovery term prevents silent absorbing state when sigma_branch < 1.0
+        // Sub-critical recovery prevents locking into a silent absorbing state (sigma < 1.0)
         const double subcritical_pull =
             (sigma_branch < kSigmaTarget)
                 ? -beta_rec * (kSigmaTarget - sigma_branch) * (g_inh - kGMin)
                 : 0.0;
 
-        // Cross-homeostatic ISN-safe update combining branching error and phase coherence error
         const double raw_dg =
             eta_inh * (err_sigma * kernel_decay + alpha_r * err_r) + subcritical_pull;
 
@@ -107,7 +105,7 @@ struct alignas(64) SynapseState {
         }
 
         g_inh = next_g;
-        last_post_ts = spike_ts;
+        last_inh_ts = spike_ts;
         return true;
     }
 };

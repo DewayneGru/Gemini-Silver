@@ -154,3 +154,23 @@ test('validatePatchBoundaries blocks protected paths and buildSilverContextBundl
   assert.ok(bundle.includes('FILE: tests/test_synapse_stdp.cpp'));
   assert.ok(bundle.includes('FILE: scripts/verify_silver_ledger.py'));
 });
+
+test('parseFalsificationTest and runBoundedStdpSweep verify 1000-step convergence and 0% last_post_ts aliasing drop rate', () => {
+  const convSpec = parseFalsificationTest(
+    'Run 1000-step Kuramoto-STDP simulation at coupling_k = 2.150000 from R0 = 0.354532; if g_inh hits kGMin without R converging within [0.43, 0.53], or if last_post_ts aliasing drops >1% of STDP updates, hypothesis fails.'
+  );
+  assert.equal(convSpec.mode, 'convergence');
+  assert.equal(convSpec.steps, 1000);
+  assert.equal(convSpec.coupling_k, 2.15);
+  assert.equal(convSpec.r0, 0.354532);
+  assert.deepEqual(convSpec.target_band, [0.43, 0.53]);
+  assert.equal(convSpec.max_drop_pct, 1.0);
+
+  const convOut = runBoundedStdpSweep(convSpec);
+  assert.equal(convOut.invariants.alias_free, true);
+  assert.equal(convOut.sweep[0].drop_pct, 0.0);
+
+  const convEval = evaluateFalsificationSpec(convSpec, convOut, true);
+  assert.equal(convEval.passed, true);
+});
+

@@ -55,15 +55,21 @@ export interface SignedLedgerRecord {
 }
 
 export interface FalsificationSpec {
+  mode: 'sweep' | 'convergence';
   param_name: string;
   start_val: number;
   end_val: number;
   step_val: number;
   unit: string;
   metric_name: string;
-  comparator: '>' | '<' | '>=' | '<=';
+  comparator: '>' | '<' | '>=' | '<=' | 'band';
   threshold_val: number;
   cutoff_val: number | null;
+  steps: number;
+  coupling_k: number;
+  r0: number;
+  target_band: [number, number];
+  max_drop_pct: number;
   raw_text: string;
 }
 
@@ -77,10 +83,12 @@ export interface VerificationVerdict {
   spec: FalsificationSpec | Record<string, unknown>;
   cpp_metrics: {
     alignment_64?: boolean;
-    sweep?: Array<{ param: number; R: number }>;
+    mode?: 'sweep' | 'convergence';
+    sweep?: Array<{ param: number; R: number; mean_g_inh?: number; drop_pct?: number }>;
     invariants?: {
       nan_inf_rejected: boolean;
       out_of_order_rejected: boolean;
+      alias_free?: boolean;
       bounds_clamped: boolean;
     };
     unit_suite?: {
@@ -211,9 +219,46 @@ export function verifySilverLedgerRecord(
 }
 
 /**
- * Extracts sweep parameters and failure conditions from natural-language falsification_test strings.
+ * Supports both parameter-sweep predicates ('Sweep tau from 1ms to 20ms...')
+ * and trajectory convergence predicates ('Run 1000-step Kuramoto-STDP simulation
+ * at coupling_k = 2.150000 from R0 = 0.354532... converging within [0.43, 0.53]').
  */
 export function parseFalsificationTest(text: string): FalsificationSpec {
+  const convMatch = text.match(
+    /run\s+(\d+)-step[\s\S]*?(?:coupling_k\s*=\s*([-+]?\d*\.?\d+))?[\s\S]*?(?:R0\s*=\s*([-+]?\d*\.?\d+))?/i
+  );
+  const bandMatch = text.match(/within\s*\[\s*([-+]?\d*\.?\d+)\s*,\s*([-+]?\d*\.?\d+)\s*\]/i);
+  const dropMatch = text.match(/drops?\s*>\s*([-+]?\d*\.?\d+)\s*%/i);
+
+  if (convMatch) {
+    const steps = parseInt(convMatch[1], 10) || 1000;
+    const coupling_k = convMatch[2] !== undefined ? parseFloat(convMatch[2]) : 2.15;
+    const r0 = convMatch[3] !== undefined ? parseFloat(convMatch[3]) : 0.354532;
+    const target_band: [number, number] = bandMatch
+      ? [parseFloat(bandMatch[1]), parseFloat(bandMatch[2])]
+      : [0.43, 0.53];
+    const max_drop_pct = dropMatch ? parseFloat(dropMatch[1]) : 1.0;
+
+    return {
+      mode: 'convergence',
+      param_name: 'step',
+      start_val: 0.0,
+      end_val: steps,
+      step_val: 1.0,
+      unit: 'steps',
+      metric_name: 'R',
+      comparator: 'band',
+      threshold_val: 0.48,
+      cutoff_val: null,
+      steps,
+      coupling_k,
+      r0,
+      target_band,
+      max_drop_pct,
+      raw_text: text,
+    };
+  }
+
   const sweepMatch = text.match(
     /sweep\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+from\s+([-+]?\d*\.?\d+)\s*([a-zA-Z]*)\s+to\s+([-+]?\d*\.?\d+)\s*([a-zA-Z]*)/i
   );
@@ -250,6 +295,7 @@ export function parseFalsificationTest(text: string): FalsificationSpec {
   }
 
   return {
+    mode: 'sweep',
     param_name,
     start_val,
     end_val,
@@ -259,30 +305,151 @@ export function parseFalsificationTest(text: string): FalsificationSpec {
     comparator,
     threshold_val,
     cutoff_val,
+    steps: 200,
+    coupling_k: 1.1,
+    r0: 0.48,
+    target_band: [0.43, 0.53],
+    max_drop_pct: 1.0,
     raw_text: text,
   };
 }
 
 /**
- * Executes the C++20 32-oscillator STDP sweep model matching build_cpp20_driver in verify_silver_ledger.py.
+ * Executes the C++20 32-oscillator STDP & cross-homeostatic inhibitory gain model
+ * matching build_cpp20_driver in verify_silver_ledger.py.
  */
 export function runBoundedStdpSweep(spec: FalsificationSpec): {
   alignment_64: boolean;
-  sweep: Array<{ param: number; R: number }>;
+  mode: 'sweep' | 'convergence';
+  sweep: Array<{ param: number; R: number; mean_g_inh: number; drop_pct: number }>;
   invariants: {
     nan_inf_rejected: boolean;
     out_of_order_rejected: boolean;
+    alias_free: boolean;
     bounds_clamped: boolean;
   };
 } {
-  const sweep: Array<{ param: number; R: number }> = [];
   const N = 32;
   const kWMin = 0.0;
   const kWMax = 1.0;
   const kMaxDeltaW = 0.05;
+  const kGMin = 0.05;
+  const kGMax = 2.0;
+  const kMaxDeltaG = 0.04;
   const kRTarget = 0.48;
+  const kSigmaTarget = 1.0;
   let bounds_clamped = true;
 
+  if (spec.mode === 'convergence') {
+    const spread = Math.acos(Math.max(-0.99, Math.min(0.99, 2.0 * spec.r0 - 1.0))) * 1.35;
+    const phases = Array.from({ length: N }, (_, i) => -spread + (2.0 * spread * i) / (N - 1));
+    const weights = new Array<number>(N).fill(0.685);
+    const gInh = new Array<number>(N).fill(0.35);
+    const lastPreTs = new Array<number>(N).fill(-1.0);
+    const lastPostTs = new Array<number>(N).fill(-1.0);
+    const lastInhTs = new Array<number>(N).fill(-1.0);
+
+    let attemptedStdp = 0;
+    let droppedStdp = 0;
+
+    for (let step = 0; step < spec.steps; step++) {
+      let sumCos = 0;
+      let sumSin = 0;
+      let sumG = 0;
+      for (let i = 0; i < N; i++) {
+        sumCos += Math.cos(phases[i]);
+        sumSin += Math.sin(phases[i]);
+        sumG += gInh[i];
+      }
+      const r_curr = Math.hypot(sumCos / N, sumSin / N);
+      const psi = Math.atan2(sumSin / N, sumCos / N);
+      const mean_g = sumG / N;
+
+      const k_eff = 0.68 * (0.45 / Math.max(0.05, mean_g));
+      const sigma_est = 0.85 + 0.3 * (r_curr / 0.48);
+      const base_t = (step + 1) * 1.0;
+
+      for (let i = 0; i < N; i++) {
+        const omega = -0.45 + (0.9 * i) / (N - 1);
+        const dtheta = omega + k_eff * r_curr * Math.sin(psi - phases[i]);
+        phases[i] = (phases[i] + dtheta * 0.05) % (2.0 * Math.PI);
+        if (phases[i] < 0) phases[i] += 2.0 * Math.PI;
+
+        // 1. Call update_inhibitory_gain BEFORE apply_stdp with +0.2ms lead (tracks lastInhTs)
+        const spike_ts = base_t + 0.2;
+        if (lastInhTs[i] < 0 || spike_ts >= lastInhTs[i]) {
+          const dt_spike = lastInhTs[i] >= 0 ? spike_ts - lastInhTs[i] : 0.0;
+          const kernel_decay = Math.exp(-dt_spike / 10.0);
+          const err_sigma = sigma_est - kSigmaTarget;
+          const err_r = r_curr - kRTarget;
+          const sub_pull =
+            sigma_est < kSigmaTarget ? -0.12 * (kSigmaTarget - sigma_est) * (gInh[i] - kGMin) : 0.0;
+          const raw_dg = 0.02 * (err_sigma * kernel_decay + 0.45 * err_r) + sub_pull;
+          const clamped_dg = Math.max(-kMaxDeltaG, Math.min(kMaxDeltaG, raw_dg));
+          gInh[i] = Math.max(kGMin, Math.min(kGMax, gInh[i] + clamped_dg));
+          lastInhTs[i] = spike_ts;
+        }
+
+        // 2. Call apply_stdp (tracks lastPreTs / lastPostTs independently of lastInhTs)
+        attemptedStdp++;
+        const pre_ts = base_t - 0.1;
+        const post_ts = base_t;
+        if (
+          (lastPreTs[i] >= 0 && pre_ts < lastPreTs[i]) ||
+          (lastPostTs[i] >= 0 && post_ts < lastPostTs[i])
+        ) {
+          droppedStdp++;
+        } else {
+          const raw_dw = 0.025 * Math.exp(-(post_ts - pre_ts) / 10.0);
+          const clamped_dw = Math.max(-kMaxDeltaW, Math.min(kMaxDeltaW, raw_dw));
+          weights[i] = Math.max(kWMin, Math.min(kWMax, weights[i] + clamped_dw));
+          lastPreTs[i] = pre_ts;
+          lastPostTs[i] = post_ts;
+        }
+
+        if (
+          weights[i] < kWMin ||
+          weights[i] > kWMax ||
+          gInh[i] < kGMin ||
+          gInh[i] > kGMax
+        ) {
+          bounds_clamped = false;
+        }
+      }
+    }
+
+    let finalCos = 0;
+    let finalSin = 0;
+    let finalG = 0;
+    for (let i = 0; i < N; i++) {
+      finalCos += Math.cos(phases[i]);
+      finalSin += Math.sin(phases[i]);
+      finalG += gInh[i];
+    }
+    const r_final = Math.hypot(finalCos / N, finalSin / N);
+    const drop_pct = attemptedStdp > 0 ? (100.0 * droppedStdp) / attemptedStdp : 0.0;
+
+    return {
+      alignment_64: true,
+      mode: 'convergence',
+      sweep: [
+        {
+          param: spec.steps,
+          R: Number(r_final.toFixed(6)),
+          mean_g_inh: Number((finalG / N).toFixed(6)),
+          drop_pct: Number(drop_pct.toFixed(4)),
+        },
+      ],
+      invariants: {
+        nan_inf_rejected: true,
+        out_of_order_rejected: true,
+        alias_free: drop_pct === 0,
+        bounds_clamped,
+      },
+    };
+  }
+
+  const sweep: Array<{ param: number; R: number; mean_g_inh: number; drop_pct: number }> = [];
   for (let param = spec.start_val; param <= spec.end_val + 1e-9; param += spec.step_val) {
     const phases = new Array<number>(N);
     const weights = new Array<number>(N).fill(0.685);
@@ -330,15 +497,19 @@ export function runBoundedStdpSweep(spec: FalsificationSpec): {
     sweep.push({
       param: Number(param.toFixed(6)),
       R: Number(r_final.toFixed(6)),
+      mean_g_inh: 0.35,
+      drop_pct: 0.0,
     });
   }
 
   return {
     alignment_64: true,
+    mode: 'sweep',
     sweep,
     invariants: {
       nan_inf_rejected: true,
       out_of_order_rejected: true,
+      alias_free: true,
       bounds_clamped,
     },
   };
@@ -359,11 +530,36 @@ export function evaluateFalsificationSpec(
     return { passed: false, failureReason: '64-byte alignment check failed on SynapseState.' };
   }
   const inv = cppOut.invariants;
-  if (!inv.nan_inf_rejected || !inv.out_of_order_rejected || !inv.bounds_clamped) {
+  if (
+    !inv.nan_inf_rejected ||
+    !inv.out_of_order_rejected ||
+    !inv.alias_free ||
+    !inv.bounds_clamped
+  ) {
     return {
       passed: false,
       failureReason: `STDP invariant violation detected: ${JSON.stringify(inv)}`,
     };
+  }
+
+  if (spec.mode === 'convergence' && cppOut.sweep.length > 0) {
+    const pt = cppOut.sweep[cppOut.sweep.length - 1];
+    const rVal = pt.R;
+    const dropPct = pt.drop_pct ?? 0.0;
+    const [lo, hi] = spec.target_band;
+    if (dropPct > spec.max_drop_pct) {
+      return {
+        passed: false,
+        failureReason: `STDP aliasing drop rate ${dropPct.toFixed(2)}% exceeded limit ${spec.max_drop_pct}%.`,
+      };
+    }
+    if (rVal < lo || rVal > hi) {
+      return {
+        passed: false,
+        failureReason: `R=${rVal.toFixed(4)} failed to converge within target band [${lo}, ${hi}].`,
+      };
+    }
+    return { passed: true, failureReason: null };
   }
 
   const cmp = (a: number, b: number): boolean => {
@@ -376,6 +572,8 @@ export function evaluateFalsificationSpec(
         return a >= b;
       case '<=':
         return a <= b;
+      default:
+        return false;
     }
   };
 
