@@ -1,8 +1,29 @@
+# Node & build artifacts
 node_modules/
 build/
 dist/
 coverage/
-.DS_Store
 *.log
-.env*
+
+# Local secrets & environment
+.env
+.env.*
 !.env.example
+
+# Runtime Watchdog ledgers, quota state & verification logs
+.silver_state/
+*.jsonl
+.antigravity_quota_state.json
+.playwright-cli/
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+.venv/
+
+# Compiled C++20 verification binaries & objects
+*.o
+*.out
+verify_driver
+test_synapse_stdp
+.DS_Store

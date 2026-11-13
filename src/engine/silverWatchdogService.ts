@@ -991,3 +991,176 @@ export function triggerSilverVerification(options: {
     },
   };
 }
+
+export interface QuotaState {
+  paused: boolean;
+  consecutive_429s: number;
+  retry_after_ms: number;
+  backoff_seconds: number;
+  remaining_seconds: number;
+  primary_model: string;
+  failover_model: string;
+  active_backend: string;
+  last_error: string | null;
+  updated_at_ms: number;
+}
+
+const QUOTA_STATE_PATH = path.join(process.cwd(), '.antigravity_quota_state.json');
+
+const PROTECTED_PATCH_PATHS = new Set([
+  '.git',
+  '.env',
+  'src/server/security.ts',
+  'src/server/telemetryGate.ts',
+]);
+
+function defaultQuotaState(): QuotaState {
+  return {
+    paused: false,
+    consecutive_429s: 0,
+    retry_after_ms: 0,
+    backoff_seconds: 0,
+    remaining_seconds: 0,
+    primary_model: 'gemini-3.1-pro-preview',
+    failover_model: 'qwen2.5-coder:7b',
+    active_backend: 'gemini-3.1-pro-preview',
+    last_error: null,
+    updated_at_ms: Date.now(),
+  };
+}
+
+function writeQuotaStateAtomic(state: QuotaState): void {
+  const tmpFile = `${QUOTA_STATE_PATH}.tmp-${process.pid}-${Date.now()}`;
+  fs.writeFileSync(tmpFile, JSON.stringify(state, null, 2) + '\n', 'utf-8');
+  fs.renameSync(tmpFile, QUOTA_STATE_PATH);
+}
+
+export function getQuotaState(): QuotaState {
+  const state = defaultQuotaState();
+  if (fs.existsSync(QUOTA_STATE_PATH)) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(QUOTA_STATE_PATH, 'utf-8'));
+      if (parsed && typeof parsed === 'object') {
+        Object.assign(state, parsed);
+      }
+    } catch {
+      // Ignore corrupt quota file
+    }
+  }
+
+  const nowMs = Date.now();
+  const retryAfterMs = Number(state.retry_after_ms || 0);
+  if (state.paused && retryAfterMs > 0 && nowMs >= retryAfterMs) {
+    state.paused = false;
+    state.active_backend = state.primary_model || 'gemini-3.1-pro-preview';
+    state.remaining_seconds = 0;
+    writeQuotaStateAtomic(state);
+  } else {
+    state.remaining_seconds = state.paused
+      ? Math.max(0, Math.floor((retryAfterMs - nowMs) / 1000))
+      : 0;
+  }
+
+  return state;
+}
+
+export function updateQuotaState(patch: Record<string, unknown>): QuotaState {
+  const current = getQuotaState();
+  const nowMs = Date.now();
+
+  if (patch.record_429) {
+    const hits = Number(current.consecutive_429s || 0) + 1;
+    const backoffSec = Math.min(
+      3600,
+      Number(patch.backoff_seconds) || 30 * Math.pow(2, hits - 1)
+    );
+    current.paused = true;
+    current.consecutive_429s = hits;
+    current.backoff_seconds = backoffSec;
+    current.retry_after_ms = nowMs + backoffSec * 1000;
+    current.remaining_seconds = backoffSec;
+    current.active_backend = current.failover_model || 'qwen2.5-coder:7b';
+    current.last_error = String(patch.error || 'HTTP 429 quota ceiling reached');
+  } else if (patch.clear_pause) {
+    current.paused = false;
+    current.consecutive_429s = 0;
+    current.backoff_seconds = 0;
+    current.retry_after_ms = 0;
+    current.remaining_seconds = 0;
+    current.active_backend = current.primary_model || 'gemini-3.1-pro-preview';
+    current.last_error = null;
+  } else {
+    if (typeof patch.paused === 'boolean') current.paused = patch.paused;
+    if (typeof patch.backoff_seconds === 'number') current.backoff_seconds = patch.backoff_seconds;
+    if (typeof patch.retry_after_ms === 'number') current.retry_after_ms = patch.retry_after_ms;
+    if (typeof patch.active_backend === 'string') current.active_backend = patch.active_backend;
+    if (patch.last_error !== undefined) {
+      current.last_error = patch.last_error ? String(patch.last_error) : null;
+    }
+  }
+
+  current.updated_at_ms = nowMs;
+  writeQuotaStateAtomic(current);
+  return current;
+}
+
+export function validatePatchBoundaries(rawResponse: string): {
+  ok: boolean;
+  error?: string;
+  files?: string[];
+} {
+  const blocks = Array.from(rawResponse.matchAll(/```(?:diff|patch)?\n([\s\S]*?)```/g)).map(
+    (m) => m[1]
+  );
+  const diffText = (blocks.length > 0 ? blocks.join('\n') : rawResponse).trim();
+  if (!diffText.includes('--- ') || !diffText.includes('+++ ')) {
+    return { ok: false, error: 'No valid unified diff headers found in payload.' };
+  }
+
+  const touchedFiles: string[] = [];
+  for (const line of diffText.split(/\r?\n/)) {
+    if (line.startsWith('+++ b/') || line.startsWith('--- a/')) {
+      const relPath = line.slice(6).trim();
+      if (relPath === '/dev/null') continue;
+      if (
+        path.isAbsolute(relPath) ||
+        relPath.split('/').includes('..') ||
+        PROTECTED_PATCH_PATHS.has(relPath) ||
+        relPath.split('/').includes('.git')
+      ) {
+        return { ok: false, error: `Blocked protected or invalid path: ${relPath}` };
+      }
+      if (!touchedFiles.includes(relPath)) {
+        touchedFiles.push(relPath);
+      }
+    }
+  }
+
+  return { ok: true, files: touchedFiles };
+}
+
+export function buildSilverContextBundle(): string {
+  const bundleFiles = [
+    'GEMINI_SILVER_SYSTEM_PROMPT.md',
+    'synapse_edge_watchdog.py',
+    'synapse_stdp.hpp',
+    'tests/test_synapse_stdp.cpp',
+    'scripts/verify_silver_ledger.py',
+  ];
+
+  const chunks: string[] = [];
+  for (const rel of bundleFiles) {
+    const abs = path.join(process.cwd(), rel);
+    if (fs.existsSync(abs)) {
+      chunks.push(
+        '==========================================',
+        `FILE: ${rel}`,
+        '==========================================',
+        fs.readFileSync(abs, 'utf-8'),
+        ''
+      );
+    }
+  }
+  return chunks.join('\n');
+}
+

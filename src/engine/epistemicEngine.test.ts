@@ -16,6 +16,8 @@ import {
   parseFalsificationTest,
   runBoundedStdpSweep,
   evaluateFalsificationSpec,
+  validatePatchBoundaries,
+  buildSilverContextBundle,
 } from './silverWatchdogService';
 
 test('resolveSteeringMode maps Kuramoto order parameter R around critical point R_c = 0.48', () => {
@@ -131,4 +133,24 @@ test('parseFalsificationTest and evaluateFalsificationSpec accurately flag falsi
   const failEval = evaluateFalsificationSpec(failingSpec, sweepOut, true);
   assert.equal(failEval.passed, false);
   assert.match(failEval.failureReason || '', /Falsified at tau=/);
+});
+
+test('validatePatchBoundaries blocks protected paths and buildSilverContextBundle packs all 5 core files', () => {
+  const blockedPatch = validatePatchBoundaries(
+    '--- a/.env\n+++ b/.env\n@@ -1 +1 @@\n-SYNAPSE_HMAC_KEY=old\n+SYNAPSE_HMAC_KEY=new\n'
+  );
+  assert.equal(blockedPatch.ok, false);
+  assert.match(blockedPatch.error || '', /Blocked protected or invalid path/);
+
+  const validPatch = validatePatchBoundaries(
+    '--- a/synapse_stdp.hpp\n+++ b/synapse_stdp.hpp\n@@ -1 +1 @@\n-// comment\n+// updated\n'
+  );
+  assert.equal(validPatch.ok, true);
+
+  const bundle = buildSilverContextBundle();
+  assert.ok(bundle.includes('FILE: GEMINI_SILVER_SYSTEM_PROMPT.md'));
+  assert.ok(bundle.includes('FILE: synapse_edge_watchdog.py'));
+  assert.ok(bundle.includes('FILE: synapse_stdp.hpp'));
+  assert.ok(bundle.includes('FILE: tests/test_synapse_stdp.cpp'));
+  assert.ok(bundle.includes('FILE: scripts/verify_silver_ledger.py'));
 });

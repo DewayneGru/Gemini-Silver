@@ -14,7 +14,7 @@ int main(int argc, char** argv) {
     }
 
     SynapseState state{};
-    const bool align_ok = (alignof(SynapseState) == 64);
+    const bool align_ok = (alignof(SynapseState) == 64) && (sizeof(SynapseState) == 64);
 
     // 1. Valid monotonic STDP step
     const bool step1_ok = state.apply_stdp(10.0, 12.5, 10.0);
@@ -22,22 +22,34 @@ int main(int argc, char** argv) {
     // 2. Reject NaN / Inf inputs
     const double qnan = std::numeric_limits<double>::quiet_NaN();
     const double pinf = std::numeric_limits<double>::infinity();
-    const bool nan_rejected = !state.apply_stdp(qnan, 15.0, 10.0) && !state.apply_stdp(15.0, pinf, 10.0);
+    const bool nan_rejected =
+        !state.apply_stdp(qnan, 15.0, 10.0) &&
+        !state.apply_stdp(15.0, pinf, 10.0) &&
+        !state.update_inhibitory_gain(qnan, 1.0, 0.48, 10.0);
 
-    // 3. Reject non-monotonic out-of-order timestamp (9.0 < 10.0)
-    const bool out_of_order_rejected = !state.apply_stdp(9.0, 13.0, 10.0);
+    // 3. Reject non-monotonic out-of-order timestamp (9.0 < 10.0 and 11.0 < 12.5)
+    const bool out_of_order_rejected =
+        !state.apply_stdp(9.0, 13.0, 10.0) &&
+        !state.update_inhibitory_gain(11.0, 1.05, 0.52, 10.0);
 
-    // 4. Verify [w_min, w_max] and max_delta_w clamping over 100 potentiation steps
+    // 4. Verify [w_min, w_max], max_delta_w, and [kGMin, kGMax] clamping
     bool bounds_ok = true;
     double ts = 20.0;
     for (int i = 0; i < 100; ++i) {
         double prev_w = state.weight;
+        double prev_g = state.g_inh;
         if (!state.apply_stdp(ts, ts + 0.5, 10.0)) {
             bounds_ok = false;
             break;
         }
+        if (!state.update_inhibitory_gain(ts + 0.5, 0.85, 0.44, 10.0)) {
+            bounds_ok = false;
+            break;
+        }
         if (std::abs(state.weight - prev_w) > state.max_delta_w + 1e-9 ||
-            state.weight < state.w_min || state.weight > state.w_max) {
+            state.weight < state.w_min || state.weight > state.w_max ||
+            std::abs(state.g_inh - prev_g) > SynapseState::kMaxDeltaG + 1e-9 ||
+            state.g_inh < SynapseState::kGMin || state.g_inh > SynapseState::kGMax) {
             bounds_ok = false;
             break;
         }
@@ -52,7 +64,8 @@ int main(int argc, char** argv) {
                   << ",\"nan_rejected\":" << (nan_rejected ? "true" : "false")
                   << ",\"out_of_order_rejected\":" << (out_of_order_rejected ? "true" : "false")
                   << ",\"bounds_ok\":" << (bounds_ok ? "true" : "false")
-                  << ",\"final_weight\":" << state.weight << "}\n";
+                  << ",\"final_weight\":" << state.weight
+                  << ",\"final_g_inh\":" << state.g_inh << "}\n";
     } else {
         std::cout << "test_synapse_stdp: " << (all_passed ? "PASS" : "FAIL") << "\n";
     }

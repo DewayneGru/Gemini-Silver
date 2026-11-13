@@ -1,0 +1,57 @@
+name: Gemini Silver C++20 & Watchdog CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  cpp20-and-watchdog-verification:
+    name: C++20 STDP Substrate & Epistemic Watchdog Verification
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Clang C++20 toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Compile and run C++20 STDP unit test suite
+        run: |
+          clang++ --version
+          clang++ -std=c++20 -O2 -Wall -Wextra -I. tests/test_synapse_stdp.cpp -o /tmp/test_synapse_stdp
+          /tmp/test_synapse_stdp
+
+      - name: Validate Python syntax across Watchdog, Verifier, and Sync Daemon
+        run: |
+          python3 -m py_compile \
+            synapse_edge_watchdog.py \
+            scripts/verify_silver_ledger.py \
+            scripts/antigravity_sync_daemon.py
+
+      - name: Run Epistemic Watchdog smoke test and end-to-end C++20 ledger verification
+        env:
+          SYNAPSE_HMAC_KEY: "ci-ephemeral-hmac-verification-key-2026"
+        run: |
+          rm -rf .silver_state
+          python3 synapse_edge_watchdog.py
+          test -f .silver_state/silver_committed_ledger.jsonl
+          python3 scripts/verify_silver_ledger.py \
+            --ledger .silver_state/silver_committed_ledger.jsonl \
+            --quarantine .silver_state/silver_scratchpad_quarantine.jsonl \
+            --header synapse_stdp.hpp \
+            --unit-test-src tests/test_synapse_stdp.cpp \
+            --out .silver_state/silver_verification_results.jsonl \
+            --compiler clang++

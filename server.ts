@@ -18,6 +18,10 @@ import {
   getSilverVerificationsState,
   ingestSilverOutput,
   triggerSilverVerification,
+  getQuotaState,
+  updateQuotaState,
+  validatePatchBoundaries,
+  buildSilverContextBundle,
 } from './src/engine/silverWatchdogService';
 
 dotenv.config();
@@ -63,6 +67,32 @@ async function startServer() {
   app.use(express.json({ limit: '2mb' }));
 
   // Silver Epistemic Ledger & C++20 Watchdog Daemon Routes
+  app.get('/quota-state', (_req, res) => {
+    res.json({ ok: true, ...getQuotaState() });
+  });
+
+  app.post('/quota-state', (req, res) => {
+    const updated = updateQuotaState(req.body || {});
+    res.json({ ok: true, ...updated });
+  });
+
+  app.post('/apply-patch', (req, res) => {
+    const content = String(req.body?.content || '');
+    if (!content.trim()) {
+      res.status(400).json({ ok: false, error: 'Empty patch content.' });
+      return;
+    }
+    const check = validatePatchBoundaries(content);
+    res.status(check.ok ? 200 : 422).json(check);
+  });
+
+  app.get('/api/silver/context-bundle', (_req, res) => {
+    const bundleText = buildSilverContextBundle();
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="gemini_silver_context.txt"');
+    res.send(bundleText);
+  });
+
   app.get('/silver-verifications', (_req, res) => {
     res.json(getSilverVerificationsState());
   });

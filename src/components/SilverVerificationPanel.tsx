@@ -405,6 +405,15 @@ export const SilverVerificationPanel: React.FC<SilverVerificationPanelProps> = (
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
+          <a
+            href={`${daemonBaseUrl}/api/silver/context-bundle`}
+            download="gemini_silver_context.txt"
+            title="Download the 5-file Gemini Silver context bundle (GEMINI_SILVER_SYSTEM_PROMPT.md, synapse_edge_watchdog.py, synapse_stdp.hpp, tests/test_synapse_stdp.cpp, scripts/verify_silver_ledger.py)"
+            className="inline-flex items-center gap-1.5 border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-100 transition-colors whitespace-nowrap shrink-0"
+          >
+            Context Bundle
+          </a>
+
           <button
             type="button"
             onClick={() => void handleCopySteeringHeader()}
